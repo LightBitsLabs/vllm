@@ -50,7 +50,28 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
         # Wait for KV layer on entry
         connector.wait_for_layer_load(layer_name)
 
-        # Execute the function
+        # Streaming attention override: if the connector marks this layer
+        # as needing windowed streaming (e.g., NoPE layers exceeding GPU
+        # KV capacity), let the connector compute attention directly
+        # instead of the native attention call.  The connector returns
+        # the output tensor; the native function is skipped entirely.
+        if (
+            hasattr(connector, "is_streaming_layer")
+            and connector.is_streaming_layer(layer_name)
+        ):
+            # Resolve 'output' kwarg for the connector to write into.
+            output = kwargs.get("output")
+            if output is None and "output" in param_names:
+                output_idx = param_names.index("output")
+                if output_idx < len(args):
+                    output = args[output_idx]
+            handled = connector.compute_streaming_attention(
+                layer_name, kv_cache, attn_metadata, output
+            )
+            if handled is not None:
+                return handled
+
+        # Execute the native attention function
         result = func(*args, **kwargs)
 
         # Save KV cache layer on exit

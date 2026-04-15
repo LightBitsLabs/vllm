@@ -360,6 +360,40 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def is_streaming_layer(self, layer_name: str) -> bool:
+        """Return True if this layer should use streaming attention.
+
+        When True, ``maybe_transfer_kv_layer`` will call
+        ``compute_streaming_attention`` instead of the native attention.
+        Override in connectors that support windowed streaming for layers
+        whose KV cache exceeds GPU capacity (e.g., NoPE layers in iRoPE
+        models).
+
+        Default: False (all layers use native attention).
+        """
+        return False
+
+    def compute_streaming_attention(
+        self,
+        layer_name: str,
+        kv_cache: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        """Compute attention via streaming windows for a fabric-backed layer.
+
+        Called by ``maybe_transfer_kv_layer`` when ``is_streaming_layer``
+        returns True.  The connector walks the sequence in windows,
+        loading evicted KV pages from the fabric and merging partial
+        attention outputs.
+
+        Returns the output tensor if handled, or None to fall back to
+        native attention.
+
+        Default: returns None (no streaming, fall through to native).
+        """
+        return None
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
