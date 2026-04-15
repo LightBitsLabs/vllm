@@ -734,6 +734,18 @@ def check_enough_kv_cache_memory(
         ValueError: If there is not enough memory available for the KV cache.
     """
 
+    # Skip memory check if the connector supports virtual paging — it can
+    # stream KV from fabric on demand and doesn't require all KV to fit in
+    # GPU memory.  Connectors advertise this via supports_kv_paging=True.
+    from vllm.distributed.kv_transfer import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+    )
+    if has_kv_transfer_group():
+        connector = get_kv_transfer_group()
+        if getattr(connector, "supports_kv_paging", False):
+            return
+
     # No need to check for available memory if the kv_cache_spec is empty
     if kv_cache_spec:
         _check_enough_kv_cache_memory(
