@@ -302,9 +302,22 @@ class Scheduler(SchedulerInterface):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        assert num_external_computed_tokens == 0, (
-            "External KV connector is not verified yet"
-        )
+        if num_external_computed_tokens:
+            # External (KV-connector) prefix hits compose with the
+            # block-aligned split exactly like local prefix-cache hits,
+            # provided the connector claims whole token blocks — the same
+            # contract MambaManager.find_longest_cache_hit imposes on local
+            # hits (non-aligned hits are skipped). A connector must restore
+            # the mamba state snapshot at the claimed boundary alongside the
+            # attention KV; loading attention KV alone would leave the
+            # linear-attention layers' recurrent state unset for the claimed
+            # span and corrupt the output.
+            assert (
+                num_new_local_computed_tokens + num_external_computed_tokens
+            ) % self.cache_config.block_size == 0, (
+                "KV connectors must claim block-aligned token counts on "
+                "hybrid (mamba) models when prefix caching is enabled"
+            )
         num_computed_tokens = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
@@ -706,7 +719,13 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled.
                             break
 
-                if self.need_mamba_block_aligned_split:
+                # Skip the split when loading KV asynchronously: num_new_tokens
+                # is 0 by design (no new work is scheduled while the remote KV
+                # streams in), so there is nothing to align — and flooring 0 to
+                # 0 here would break out of scheduling before allocate_slots /
+                # update_state_after_alloc run, leaving the request WAITING and
+                # re-claiming the same prefix every step, forever.
+                if self.need_mamba_block_aligned_split and not load_kv_async:
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
@@ -2171,8 +2190,13 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # Hybrid models have one block list per KV cache group; scan every
+            # group, since externally loaded blocks live only in the group(s)
+            # the connector populates. The per-request truncation bookkeeping
+            # (marked_invalid_block / num_computed_tokens) is shared across
+            # groups, matching the single-group semantics when only one group
+            # carries externally loaded blocks.
+            req_block_ids_groups = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
@@ -2182,39 +2206,42 @@ class Scheduler(SchedulerInterface):
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
             ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
-                    continue
+            for req_block_ids in req_block_ids_groups:
+                for idx, block_id in zip(
+                    range(req_num_computed_blocks), req_block_ids
+                ):
+                    if block_id not in invalid_block_ids:
+                        continue
 
-                is_affected = True
+                    is_affected = True
 
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
+                    if block_id in marked_invalid_block_ids:
+                        # This invalid block is shared with a previous request
+                        # and was already marked for recomputation.
+                        # This means this request can still consider this block
+                        # as computed when rescheduled.
+                        # Currently this only applies to sync loading; Async
+                        # loading does not yet support block sharing
+                        continue
 
-                marked_invalid_block_ids.add(block_id)
+                    marked_invalid_block_ids.add(block_id)
 
-                if marked_invalid_block:
-                    # This request has already marked an invalid block for
-                    # recomputation and updated its num_computed_tokens.
-                    continue
+                    if marked_invalid_block:
+                        # This request has already marked an invalid block for
+                        # recomputation and updated its num_computed_tokens.
+                        continue
 
-                marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
-                num_affected_tokens = (
-                    req_num_computed_tokens - request.num_computed_tokens
-                )
-                total_affected_tokens += num_affected_tokens
+                    marked_invalid_block = True
+                    # Truncate the computed tokens at the first failed block
+                    request.num_computed_tokens = idx * self.block_size
+                    num_affected_tokens = (
+                        req_num_computed_tokens - request.num_computed_tokens
+                    )
+                    total_affected_tokens += num_affected_tokens
 
-                # collect invalid block and all downstream dependent blocks
-                if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    # collect invalid block and all downstream dependent blocks
+                    if evict_blocks:
+                        blocks_to_evict.update(req_block_ids[idx:])
 
             if is_affected:
                 if not marked_invalid_block:
