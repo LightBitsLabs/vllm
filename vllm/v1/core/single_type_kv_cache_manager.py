@@ -955,7 +955,13 @@ class MambaManager(SingleTypeKVCacheManager):
             num_required_blocks = (
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
-            if num_required_blocks == len(req_blocks):
+            if num_required_blocks <= len(req_blocks):
+                # A KV-load-failure recovery can truncate a request's computed
+                # tokens below its existing allocation, leaving the table
+                # LONGER than required; nothing new needs allocating (the
+                # extra blocks are freed by remove_skipped_blocks as the
+                # recompute progresses). The strict greater-than assert here
+                # killed the engine on that path.
                 return []
             else:
                 assert num_required_blocks > len(req_blocks), (
